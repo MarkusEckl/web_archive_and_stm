@@ -1,4 +1,4 @@
-To see the R notebook (and not just the code), proceed as follows:
+If you want to see the full R notebook (and not just the code), proceed as follows:
 
 1. Open the html: "The use of topic modeling (STM) in web archives.html"
 2. Copy the opend URL 
