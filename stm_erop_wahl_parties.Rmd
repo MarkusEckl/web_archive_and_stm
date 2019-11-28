@@ -1,0 +1,477 @@
+---
+title: "The use of topic modeling (STM) in web archives"
+output:
+  html_notebook:
+    code_folding: hide
+    theme: readable
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: no
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+The following R Notebook shows an experimental analysis of a web archive. The main goal is to identify and analyse dominant topics from websites of five german parties about the election campaign for the european parliament election 2019. For this, a text corpus was constructed, based on a new text extractor tool which was developed by Gassner (2019). The analysis and text extractor is part of the DFG project [‘Web archives – Methods of Digital Humanities in application for creating and accessing web archives'](https://www.dfg.de/en/dfg_profile/statutory_bodies/general_assembly/index.html).   
+
+Besides the Latent Semantic Analysis (LSA) by Deerwester et al. (1990), the Latent Dirichlet Allocation (LDA) by Blei et al. (2003) is probably the best-known method of Topic Modeling. In this Notebook a faster LDA algorithm (spectral) form Arora et al. (2014) is used, which calculate the LDA model with only the most frequent 10000 tokenized terms from the corpus. This algorithm  
+
+This algorithm and many other methods of topic modeling are part of the R package STM by [Roberts et al. (2018)](https://cran.r-project.org/web/packages/stm/vignettes/stmVignette.pdf). Beside different NLP techniques this package is the main part of this notebook. 
+
+
+```{r setup}
+#path to the project
+knitr::opts_knit$set(root.dir = normalizePath("/home/eckl/analyse_eu_wahl_stm/")) 
+```
+
+# Data preparation
+## Load packages and read json data 
+```{r}
+library(jsonlite)
+library(dplyr)
+library(markdown)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(tidyr)
+library(magrittr)
+library(quanteda)
+library(spacyr)
+library(stm)
+library(DT)
+library(sna)
+library(ggrepel)
+#load and convert json to dataframe 
+json = jsonlite::stream_in(file("data/unique_texts_20191125T124656.json"))
+df = jsonlite::flatten(json)
+
+#change the datatype 
+df$data.released_at.value <- as.Date(df$data.released_at.value)
+
+#delate all duplicate documents & select special columns 
+df2 <- df %>%
+  distinct(data.body.value, .keep_all = TRUE) %>%
+  filter(data.body.size > 250) %>% 
+  filter(data.released_at.value >= "2019-01-01" & data.released_at.value <= "2019-08-01") %>%
+  select(meta.name, meta.issuer,meta.type,meta.created_at,
+         data.released_at.value, meta.target.netloc,
+         data.title.value, data.body.value)
+```
+
+## Overview dataframe 
+```{r, echo=FALSE, results= "asis"}
+kable(df2 %>% head(5)) %>%
+  kable_styling() %>%
+  scroll_box(width = "800px", height = "300px")
+```
+
+## Summary parties
+Number of documents differentiated according to the websites of the parties. 
+```{r}
+#summary of documents differenced by parties
+summary(as.factor(df2$meta.target.netloc))
+```
+
+## Plots
+```{r}
+#plot distribution 
+library(scales)
+g <- ggplot(df2, aes(x = data.released_at.value)) +
+   geom_bar(aes(fill=meta.target.netloc)) +
+  labs(title="Distribution of documents over time and parties: Days") +
+  scale_x_date(date_breaks = "2 weeks",
+               date_minor_breaks = "2 weeks") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  scale_y_continuous(name = "N documents", breaks = c(seq(0,30, 5))) + 
+  scale_fill_manual(values=c(www.afd.de = "brown",
+                                 www.cdu.de = "blue",
+                                 www.csu.de = "black", 
+                                 www.gruene.de = "green" ,
+                                 www.spd.de = "red"))
+g
+```
+```{r}
+#load('output_data/web_archive_eu_election_tokens.RData')
+df2$week <- as.Date(cut(df2$data.released_at.value,
+                            breaks = "week",
+                            start.on.monday = FALSE))
+
+df2$month <- as.Date(cut(df2$data.released_at.value,
+                            breaks = "month",
+                            start.on.monday = FALSE))
+#datatable frequency table 
+df.plot <- df2 %>% 
+  group_by(week, meta.target.netloc) %>% 
+  summarise(value = length(data.body.value))
+
+
+#plot weekly crawled documents by party
+ggplot(df2, aes(week))+
+  geom_bar(aes(fill = meta.target.netloc)) +
+    labs(title="Distribution of documents over time and parties: Weeks") +
+  scale_x_date(date_breaks = "2 weeks",
+               date_minor_breaks = "1 weeks") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  scale_y_continuous(name = "N documents", breaks = c(seq(0,80, 5)))+
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values=c(www.afd.de = "brown",
+                               www.cdu.de = "blue",
+                               www.csu.de = "black", 
+                               www.gruene.de = "green" ,
+                               www.spd.de = "red"))
+
+
+#plot month crawled documents by party
+ggplot(df2, aes(month))+
+  geom_bar(aes(fill = meta.target.netloc)) +
+    labs(title="Distribution of documents over time and parties: Months") +
+  scale_x_date(date_breaks = "4 weeks",
+               date_minor_breaks = "4 weeks") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  scale_y_continuous(name = "N documents", breaks = c(seq(0,150, 10)))+
+  theme(legend.position = "bottom") +
+  scale_fill_manual(values=c(www.afd.de = "brown",
+                               www.cdu.de = "blue",
+                               www.csu.de = "black", 
+                               www.gruene.de = "green" ,
+                               www.spd.de = "red"))
+
+```
+
+# NLP 
+## POS-Tagging & Lemmatising & Stop-Words  
+In the following, [spacy](https://spacy.io/) and the R package [quanteda](https://quanteda.io/) are used. 
+```{r message=FALSE, warning=FALSE, results = 'hide', eval = FALSE}
+
+#Initialize spaCy to call from R.
+spacy_initialize(model = 'de' ,refresh_settings = TRUE)
+#tokenize and tag the texts, and returns a data.table of the results
+parsed <- spacy_parse(df2$data.body.value)
+#terminates the python process in the backround
+spacy_finalize()
+
+#create tokens and use lammatastion of the words
+#remove puncation, numbers, stopwords and special topkens
+#min. character are 4
+tokens <- as.tokens(parsed, use_lemma = TRUE) %>% 
+  tokens(remove_punct = TRUE, remove_numbers = TRUE) %>% 
+  tokens_tolower() %>% 
+  tokens_remove(c(stopwords('de'), "vgl", "hinsichtlich", 
+                  "11nd", "z._b.", "cine", "hierzu", "erstens", "zweitens", "deutlich", "tion",
+                   "geben", "mehr", "immer", "schon", "gehen", "sowie", "erst", "mehr", "etwa",
+                  "dabei", "dis-", "beziehungsweise", "seit", "drei", "insbesondere", 
+                  stopwords("en")),
+                min_nchar = 2L,  padding = TRUE)
+
+#quanteda- Identify and score multi-word expressions, or adjacent fixed-length collocations, from text
+#min count 30 
+collocation <- textstat_collocations(tokens, min_count = 10)
+#quanteda - cearce Bi-grams 
+tokens <- tokens_compound(tokens, collocation, join = FALSE)
+
+#quanteda - Get or set variables associated with a document in a corpus, tokens or dfm object.
+docvars(tokens) <- df2 %>% select(data.body.value, data.released_at.value, meta.target.netloc) 
+
+
+dfm_parties <- tokens %>% 
+  dfm() %>% 
+  dfm_select(min_nchar = 2L) %>% 
+  dfm_trim(min_docfreq = 5) %>%  # minimum 50 documents (removes rare terms)
+   dfm_trim(max_docfreq = 0.5,
+            docfreq_type = 'prop') # maximum in 25 percent of documents (stop words)
+
+
+save.image('output_data/web_archive_eu_election_tokens.RData')
+
+length(parsed$token)
+```
+
+The corpus includes 297.742 tokens form 635 documents. 
+
+
+
+
+#STM - Topic Modeling 
+## Evaluation 
+Different evaluation methods are discussed in the literature, whereby the coherence measure of Mimno (2011) is often used to determine the number of topics. Mimno's (2011) algorithm emphasizes the number and weighting of co-occurrences of words in the documents for the quality of the topics. Beside Mimno (2011) the exclusivity is an another helpful metric (Bischof & Airoldi 2012) and Rogers et al. (2014) use both metrics to calculate the optimal number of topics. However, it should also be noted here that a particularly high degree of this metrics is not synonymous with a human model that is easy to interpret. Therefore, it is essential to calculate and compare different models, as well as to examine the documents themselves qualitatively on a random basis. 
+### Overview
+```{r}
+dfm2stm <- convert(dfm_parties, to = "stm")
+
+#calculate different stm models with k topics
+kResult <- searchK(dfm2stm$documents, dfm2stm$vocab, K=c(20,40,60,80,100), data=dfm2stm$meta)
+
+#oveview differnt metrics 
+plot.searchK(kResult)
+```
+
+### Semantic Coherence & Exclusivity
+After comparing several models and evaluating the topics' ability to be interpreted, the model with 60 topics was selected. 
+```{r}
+#build a dataframe 
+semantic_coherence <- kResult$results$semcoh
+exclusivity <- kResult$results$exclus
+topic_model <- kResult$results$K
+n_topics <- c("20 Topics", "40 Topics", "60 Topics", "80 Topics","100 Topics")
+evaluation_var <-data.frame(exclusivity,semantic_coherence, topic_model, n_topics)
+evaluation_var
+
+#Plot
+px <- ggplot(evaluation_var, aes(semantic_coherence, exclusivity)) +
+  geom_point(color = 'red')+ 
+  geom_label_repel(aes(label = n_topics, 
+                       fill = factor(n_topics)), color = 'white',
+                   size = 2.5) +
+  theme(legend.position = "bottom") +
+  labs(title="Models evaluation: Semantic coherence and exclusivity", x = "semantic coherence", 
+       y = " exclusivity") + labs(fill = "Modelle mit ")
+  theme_update(plot.title = element_text(hjust = 0.5))
+px
+```
+
+ 
+## Calculate the "best" model 
+```{r  warning=FALSE, paged.print=FALSE, results='hide'}
+topic.count <- 60
+
+#init.type - Spectral: The default choice, "Spectral", provides a deterministic inialization using the spectral algorithm given in Arora et al 2014. The fastes alorithm! 
+model.stm <- stm(dfm2stm$documents, 
+                 dfm2stm$vocab, 
+                 K = topic.count, 
+                 data = dfm2stm$meta, 
+                 init.type = "Spectral") 
+
+save.image('output_data/web_archive_eu_election_tokens.RData')
+```
+
+
+
+## Overview topics
+For a better human interpretation of the topics, the STM Package offers the possibility to create differently weighted word lists of the individual topics (Roberts et al. 2018). The respective weights emphasize different characteristics of the words in context of the documents and thus can be facilitate the human process of labelling of the topics. Two weights were used for this study.
+
+### Highest probability wight 
+```{r, echo=FALSE, results= "asis"}
+library(markdown)
+library(knitr)
+library(kableExtra)
+
+df.topics.score <- data.frame(t(labelTopics(model.stm, n = 20)$score))
+
+kable(df.topics.score %>% head(10)) %>%
+  kable_styling() %>%
+  scroll_box(width = "800px", height = "600px")
+```
+
+###Frex - exclusivity wight
+```{r, echo=FALSE, results= "asis"}
+df.topics.score <- data.frame(t(labelTopics(model.stm, n = 20)$frex))
+
+kable(df.topics.score %>% head(10)) %>%
+  kable_styling() %>%
+  scroll_box(width = "800px", height = "600px")
+```
+
+## Topic labels
+```{r fig.height=12, fig.width=15}
+
+#Topics with the label "xxx_" mean that the topic cannot be interpreted well. 
+topic.id <- c(seq(1,60,1))
+topic.label <- c("Flüchtlingespolitik", "Kohleausstieg", "Rechtsextremismus & Bundestag", "xxx_Gottschalk",
+                 "Söder & CSU", "CSU & Europawahl", "xxx_grüne", "Grundsteuer", "Pflege", "Forschung & Bildung",
+                 "xxx_programm", "xxx_de", "Grundsatzprogramm der Grünen", "Iran & Außenpolitik", 
+                 "CDU & Europawahl", "Casa Walter Lübcke", "SPD Harz kritik & Reform", "Handelsabkommen", 
+                 "xxx_workshop", "Orban, Weber, Timmerman", "xxx_presse", "Artenschutz & Bayern", 
+                 "Weber & afd & Türkei", "afd &  Verfassungsschutz", "Natur", "Regierungen und EU", 
+                 "xxx_parteizentralen", "xxx_parlamentarisch", "Grundrente & Konflikt", 
+                 "Bayern & Grenzkontrolle", "Gründe für Grundrente", "DDR & Mauerfall", "Lübcke & Hass", 
+                 "Eurozone & Ökologie & Ökonomie", "xxx_spende", "Baukindergeld & Wohnungen", 
+                 "xxx_generell", "Investitionen Infrastruktur & scharze Null", 
+                 "Antisemitismus & musl. Zuwanderung", "Söder & Weber vs. Populisten", 
+                 "Habeck & Garantiesicherung (Diesel)", "Bayern Staatsregierung", "EU & soziale Ungleichheit",
+                 "Krisen EU", "Landwirtschaft & Pestizide", "Starke-Familien-Gesetz", 
+                 "Weber & EVP Spitzenkandidat", "Bundeswehr & Söder", "Urheberrecht", "xxx_cdu", 
+                 "xxx_schwangere", "Fahrverbote in Städten", "Klimaschutz Bewegung (FFF)", 
+                 "Demokratie & Rechtsstaatlichkeit", "Polizei & Sicherheit", "twitter & Gleichstellung",
+                 "Großbritanien & Demokratie", "Kriminalität & Ursachen", "xxx_aufmerksam",
+                 "Grüne & Programmatik")
+
+df.topic.labels <- as.data.frame(topic.id)
+df.topic.labels$label <- topic.label
+
+# "bad" topics delate  
+topic.del <- c(4, 7, 11, 12, 19, 21, 25, 27, 28, 35, 37, 50, 51, 59)
+```
+
+## Visualisation 
+### Most discucssed topics
+```{r fig.height=7, fig.width=15}
+# Extract theta from the stm-model
+df.proportion <- as.data.frame(colSums(model.stm$theta/nrow(model.stm$theta)))
+df.s <- cbind(df.topic.labels, df.proportion)
+colnames(df.s) <- c("id", "label", "probability")
+
+`%not_in%` <- purrr::negate(`%in%`)
+df.s2 <- df.s %>% filter(id %not_in% topic.del) #only topics which can be interpreted!
+
+# Sort the dataframe
+df.s3 <- df.s2[order(-df.s2$probability), ] %>% drop_na()
+df.s3$labels <- factor(df.s3$label, levels = rev(df.s3$label))
+df.s3$probability <- as.numeric(df.s3$probability)
+df.s3$probability <- round(df.s3$probability, 4)
+
+# Plot graph top 15
+ht <- ggplot(df.s3 %>% head(15), aes(x = labels, y = probability)) + 
+   geom_bar(stat = "identity", width = 0.2) +
+   coord_flip() + 
+  geom_text(aes(label = scales::percent(probability)), #Scale in percent
+            hjust = -0.25, size = 2,
+            position = position_dodge(width = 1),
+            inherit.aes = TRUE) +
+  ggtitle(label = paste0("Top 15 Topics")) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ht
+```
+
+### Word clouds
+```{r fig.height=10, fig.width=15}
+library(RColorBrewer)
+library(wordcloud)
+
+#topic.count <- 140
+par(mfrow=c(3,3))
+for (i in seq_along(sample(df.s2$id)))
+{
+  cloud(model.stm, topic = i, scale = c(4,.40), 
+        max.words = 20, main = paste0("Topic ")) 
+}
+```
+
+### Word-Topic comparison
+This plot calculates the difference in probability of a word for the two topics, normalized by the maximumdifference in probability of any word between the two topics. 
+```{r}
+plot(model.stm, type = "perspectives", topics = c(1,26), n = 15)
+plot(model.stm, type = "perspectives", topics = c(55,33), n = 20)
+```
+
+### Correlation grpah
+For a better interpretation of the model and for a better understanding of the topics and how they relate to each other, the STM Package provides the calculation of a correlation graph. In this context, correlation means the probability that two topics within a document will co-occur together. The nodes of this network represent the individual topics and a connection between two nodes means a positive correlation that exceeds a threshold previously defined by humans. The larger the nodes of the network (or their labels), the more frequently the topic appears in the corpus. The thicker the edges and the closer together the topics are visualized, the greater the probability that two topics correlate. 
+```{r fig.height=20, fig.width=20}
+library(stminsights)
+library(shiny)
+library(shinydashboard)
+library(ggraph)
+
+stm_corrs <- get_network(model = model.stm,
+                         method = 'simple',
+                         labels = paste(df.topic.labels$label),
+                         cutoff = 0.02, #Importent correlation cutoff!!!
+                         cutiso = TRUE)
+
+graph <-ggraph(stm_corrs, layout = 'fr') +
+  geom_edge_link(
+    aes(edge_width = weight),
+    label_colour = '#fc8d62',
+    edge_colour = '#377eb8') +
+  geom_node_point(size = 4, colour = 'black')  +
+  geom_node_label(
+    aes(label = name, size = props),
+    colour = 'black',  repel = TRUE, alpha = 0.65) +
+  scale_size(range = c(5, 13), labels = scales::percent) +
+  labs(size = 'Topic Proportion',  edge_width = 'Topic Correlation') +
+  scale_edge_width(range = c(2, 9)) +
+  theme_graph()
+
+graph
+```
+
+### Clustering Modularity 
+```{r fig.height=20, fig.width=20}
+library(igraph)
+
+clp <- cluster_label_prop(stm_corrs)
+plot_clp <- plot(clp, stm_corrs)
+```
+
+
+
+#Regression I
+
+The innovative feature of the STM Package is the possibility to integrate covariates into the LDA model (Roberts et al. 2018). This means that the topical prevalence is set concerning other characteristics. The use of possible covariates should be justified theoretically, as it is crucial why the chosen characteristic can influence the frequency with which a topic is discussed. To be able to analyze the occurrence of topics over time, the publication day of the text on the webside is used. A regression is calculated in which the dependent variable is the probability of a topic  occurring in a documentand and the independent variable is the publication day of the text on the webside (Roberts et al. 2014). 
+## Calcualte Estimate Effect
+```{r fig.height=20, fig.width=20}
+load('output_data/web_archive_eu_election_tokens.RData')
+
+#IMPORTANT STM does not work with DATA TYPE!!!
+dfm2stm$meta$datum <- as.numeric(as.factor(dfm2stm$meta$data.released_at.value))
+model.stm.ee <- estimateEffect(1:topic.count ~  s(datum), model.stm, meta = dfm2stm$meta)
+```
+
+## Ugly plots
+```{r fig.height=10, fig.width=10}
+par(mfrow=c(3,3))
+for (i in seq_along(df.s2$id))#df.s %>% filter(id
+{
+  plot(model.stm.ee, "datum", method = "continuous", topics = i, main = paste0("Topic ",                              df.topic.labels$topic.id[i], ": ", df.topic.labels$label[i]))
+}
+
+```
+
+## Pretty plot
+```{r}
+#get_effects form Charsten Schwemmers package stminsights 
+library(stminsights)
+effects <- get_effects(estimates = model.stm.ee,
+                          variable = 'datum',
+                          type = 'continuous')
+
+#Join Topic Labels and effects Dataframe
+df.topic.labels$topic <- as.factor(df.topic.labels$topic.id)
+effects2 <- left_join(effects, df.topic.labels, by = "topic")
+
+# plot effects
+plot_diff_top <- function(topic_number){
+  
+  p_jahr <- effects2 %>% filter(topic == topic_number) %>%
+      ggplot(aes(x = value, y = proportion, color = label,
+      group = label, fill = label)) +
+      geom_line() +
+      geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2)  +
+      theme_light() + labs(x = 'day', y = 'Topic Proportion')  +
+      theme(legend.position = "bottom") +
+    ggtitle(label = paste0("Diffusion of Topics")) +
+     theme(plot.title = element_text(hjust = 0.5))
+    
+  p_jahr
+}
+
+plot_diff_top(c(1,3))
+plot_diff_top(c(16))
+```
+
+
+## Regression II
+Dependent variable: the probability of a topic occurring in a document
+Independent variable: Webside of the parties
+Here you can see which party treats the issue more or less in relation to the other parties. 
+```{r fig.height=5, fig.width=10}
+dfm2stm$meta$meta.target.netloc2 <- as.numeric(as.factor(dfm2stm$meta$meta.target.netloc))
+#
+model.stm.ee.parties <- estimateEffect(1:topic.count ~  s(meta.target.netloc2), model.stm, meta = dfm2stm$meta)
+
+
+effects.parties <- get_effects(estimates = model.stm.ee.parties,
+                          variable = 'meta.target.netloc2',
+                          type = 'pointestimate')
+
+plot(model.stm.ee.parties, "meta.target.netloc2", method = "pointestimate", topics = 1, main = paste0("Topic", df.topic.labels$topic.id[1], ": ", df.topic.labels$label[1]))
+```
+
+
+
+
+
+
